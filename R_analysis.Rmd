@@ -1,0 +1,132 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+```{r}
+setwd("C:/Users/dtrag/Documents/animeData")
+```
+## Data Collection
+(Skip this if you are only intersted in the R data analysis)
+This project deals with public user profiles on myanimelist.com. These profiles contain a lot of data, but the only personal data I collect are their anime ratings on a scale of 1-10. Their usernames are not even stored in my SQL database, so I have no way of tracing the numbers back to their users. I used python HTTP requests to collect all the revevant data from myanimelist.com's free REST API and sqlite to store it. The general steps I took are:
+1. Verify how many users exist on myanimelist.com and exploit their "Member Search" feature to get the usernames of all users who claim to be between 10 and 36 years old. I store all these usernames in a CSV file after removing duplicates.
+2. Create several API keys for myanimelist's API, and asynchronously execute GET requests that take usernames as input and return said user's anime reviews as output. This is a type of web scraping. I was able to do about 4 GET requests per second at best after finding a rotating proxy server and rotating 3 API keys. This does not violate myanimelist.com's terms of service. My code did keep stopping due to rate limiting, so I manually retried each time until it completed.
+3. Occasionally during step 2, the code stores the user data in a `user_records` table in sqlite to prevent overflowing my computer's memory. The final table ended up being over 3 gigabytes.
+4. Once I had gotten data for all the usernames, verify that there is no duplicated data with SQL and delete duplicated rows
+5. Get metadata for all the distinct animes that were reviewed by the 900,000 users and store in another SQL table `anime_info`. Every anime in `anime_info` has an integer `id` that corresponds to the `anime_id` column in user_records. A lot of anime has missing fields, which just become null in sqlite. The metadata includes official and english titles, start dates, end dates, images, genres, studios, the number of scoring users, and more. There ended up being only being ~12000 unique animes in my data, which is convenient because the entire table easily fits in memory.
+6. Create SQL indexes on specific columns in `user_records` table to speed up queries.
+## Goals
+Before diving into data exploration, I want to explain some of my goals in this project besides finding cool associations.
+
+1. I will do whatever I can in R, but there are certain things like web scraping and interacting with sqlite that I think python is better for, so a few of my results will come from python, but they are based on the same data.
+2. I want to practice making and optimizing complex SQL queries that are time efficient and return result sets that are memory-efficient. This is why SQL will do the majority of the data wrangling - I simply wanted to do it that way, even if it was overcomplicated. Some of the statistics I calculate with SQL are reported directly on myanimelist.com's website, but I derive them myself for fun.
+3. I want to connect the phenomenons I see in the data with some personal experience I gained from watching anime for a couple years. For example, if I find a correlation in the ratings between two animes that are very similiar, I plan to consider all the possible things that made them more similiar than other combinations of animes, even if those things are subjective or not provable. 
+4. Because my sample of anime reviews comes from a website with many dishonest or inconsistent users, there is bound to be some bias and human error in the data. I want to consider how user habits may impact the significance of certain conclusions. One main goal of the project in general is to determine "what goes into" an anime review - both directly and indirectly. The users in my data are probably not perfectly representative of the general public given that they exist on a website dedicated to anime. That's one of the facts I will ignore since I have no way to adjust to it.
+
+## Data Exploration
+### Genres
+The first factor I want to explore are anime genres, since I believe genres are probably the #1 factor that people consider when choosing anime to watch. Over the course of anime history, various genres have rose to prominence. 
+```{r}
+library(RSQLite)
+```
+Here we do a little aggregation to reduce the size of the result set
+```{r}
+con <- dbConnect(SQLite(), dbname = "animeDB2.sqlite3")
+query = "Select genres,count(id) c from anime_info group by genres"
+genresDF <- dbGetQuery(con,query)
+head(genresDF)
+```
+```{r}
+a = genresDF[2,]
+print(a)
+#summary(genresDF)
+```
+
+Then we distribute the counts to each individual genre. I could have simply loaded the entire dataset into R and used the table function, but that's probably memory-intensive and no fun.
+```{r}
+genres_counter <- c()
+
+distribute <- function (row) {
+  count <- row["c"][[1]]
+  values <- noquote(strsplit(row["genres"], ';')[[1]])
+  for (i in 1:length(values)) {
+    if (is.element(values[i], names(genres_counter))) {
+      #if genre is already in genres counter
+      genres_counter[values[i]] <<-
+        as.numeric(genres_counter[values[i]]) + as.numeric(count)
+    } else if (is.null(names(genres_counter))) {
+      #if genres counter is empty
+      genres_counter <<- c(count)
+      names(genres_counter) <<- c(values[i])
+      
+    }
+    else {
+      genres_counter <<-
+        c(genres_counter, count) #creates new genre at the end with value of the first count
+      names(genres_counter)[length(genres_counter)] <<- values[i]
+    }
+  }
+}
+#values = rep(c("romance", "mystery", "drama"), 10)
+apply(genresDF, MARGIN = 1, distribute)
+genres_counter
+
+```
+```{r}
+library(ggplot2)
+genres_counter2 = subset(data.frame(c = c(as.numeric(genres_counter)), name = names(genres_counter)),c>100)
+genres_counter2 = genres_counter2[order(-genres_counter2$c),]
+genres_counter2$name = factor(genres_counter2$name,levels=genres_counter2$name)
+#genres_counter2 = genres_counter2[order(genres_counter2$c),]
+genres_counter2
+p <- ggplot(data=genres_counter2,aes(x=name,y=c)) +
+  geom_bar(stat="identity") +
+  theme(axis.text.x=element_text(angle=45,hjust=1,vjust=1))+
+  theme(axis.title.x=element_blank())
+p
+#barplot(genres_counter2[genres_counter2>100],las=2,cex.names = .5)
+```
+Here I should clarify that genres are not independent and are not mutually exclusive either. Animes typically are assigned anywhere from 1-8 genres by myanimelist completely manually (there is no official standard). It is very common to see Drama and Romance together, or Slice of Life and Romance. Likewise, Action and Adventure are a very common pair. I am curious about the developement of certain genres over time. Let's find the average score for the game genre over time. Note: certain anime's popularity will not skew this SQL query since I am averaging scores on a per-anime basis, not a per-user basis.
+```{r}
+query = "select avg(average) y,(cast(strftime('%Y',a.start_date) as int)) x from 
+(select avg(score) average,anime_id from user_records u group by anime_id)  inner join anime_info a on anime_id = a.id and a.genres like '%Game%' 
+and cast(strftime('%Y',a.start_date) as int) > 0
+group by strftime('%Y',a.start_date) "
+gamesDF <- dbGetQuery(con,query)
+p <- ggplot(data=gamesDF,aes(x=x,y=y)) +
+  geom_bar(stat="identity") +
+  theme(axis.text.x=element_text(angle=90,hjust=1,vjust=1))+
+  xlab("Year") + ylab("Average score for game genre")
+p
+```
+Hmm not very exciting. What about the Sci-Fi genre?
+```{r}
+query = "select avg(average) y,(cast(strftime('%Y',a.start_date) as int)) x from 
+(select avg(score) average,anime_id from user_records u group by anime_id)  inner join anime_info a on anime_id = a.id and a.genres like '%Sci-Fi%' 
+and cast(strftime('%Y',a.start_date) as int) > 0
+group by strftime('%Y',a.start_date) "
+gamesDF <- dbGetQuery(con,query)
+p <- ggplot(data=gamesDF,aes(x=x,y=y)) +
+  geom_bar(stat="identity") +
+  theme(axis.text.x=element_text(angle=90,hjust=1,vjust=1))+
+  xlab("Year") + ylab("Average score for Sci-Fi genre")
+p
+```
+Well, there certainly appears to be some trend before the year 2000, but it is hard to make a claim yet since we do not know if the quality of anime in general has increased throughout the years.
+
+The last thing I want to check is simply the average rating for each genre. Surely, there are some genres that are liked more than others.
+```{r}
+query1 = "select distinct(genres) g from anime_info"
+allGenres <- dbGetQuery(con,query1)
+unique_genres <- c("Adventure")
+growVector <- function (row) {
+  values <- noquote(strsplit(row["g"], ';')[[1]])
+  unique_genres <<- c(unique_genres,values)
+}
+temp = apply(allGenres, MARGIN = 1, growVector)
+unique_genres <- unique(unique_genres)
+unique_genres
+```
+```{r}
+
+```
+
