@@ -2,6 +2,8 @@
 title: "R Notebook"
 output: html_notebook
 ---
+## Replicating my Code
+To replicate this code, you will need to have my sqlite database in the same directory as this R notebook, which I can share if it is necessary. You will also need to install the R packages RSqlite and reticulate. Both can be installed with the R install.packages() command. The first can execute and fetch sql queries and data in r and the second can run python in R. That also means you need to have a valid python interpreter set up on your machine and you must set up reticulate with it. This tutorial helped me with that: https://docs.rstudio.com/tutorials/user/using-python-with-rstudio-and-reticulate/. Also, some of my plots use ggplot, so if your environment did not come with ggplot2, install that. Some of these queries took several minutes to run on my laptop due to R trying to load tons of data from SQL, so be patient or use a system with a fast disk and CPU.
 ```{r}
 setwd("C:/Users/dtrag/Documents/animeData")
 ```
@@ -34,11 +36,6 @@ con <- dbConnect(SQLite(), dbname = "animeDB2.sqlite3")
 query = "Select genres,count(id) c from anime_info group by genres"
 genresDF <- dbGetQuery(con,query)
 head(genresDF)
-```
-```{r}
-a = genresDF[2,]
-print(a)
-#summary(genresDF)
 ```
 
 Then we distribute the counts to each individual genre. I could have simply loaded the entire dataset into R and used the table function, but that's probably memory-intensive and no fun.
@@ -113,7 +110,283 @@ p
 ```
 Well, there certainly appears to be some trend before the year 2000, but it is hard to make a claim yet since we do not know if the quality of anime in general has increased throughout the years.
 
-The last thing I want to check is simply the average rating for each genre. Surely, there are some genres that are liked more than others.
+I also want to check the average rating for each genre. Surely, there are some genres that are liked more than others. However, because the myanimelist.com system often adds certain groups of genres to animes, analyzing them it probably wouldn't do much good to compare any statistics for individual genres with my current data.
+
+### Viewership over time
+Let's see how many animes were produced each year:
+```{r}
+query3 = "select cast(strftime('%Y',start_date) as int) year,count(id) count from anime_info group by year having year > 0"
+yearsDF <- dbGetQuery(con,query3)
+p <- ggplot(data=yearsDF,aes(x=year,y=count)) +
+  geom_bar(stat="identity") +
+  theme(axis.text.x=element_text(angle=90,hjust=1,vjust=1))+
+  xlab("Year") + ylab("Number of Animes produced by year")
+p
+```
+Wow, barely any anime existed before 1970, and there's a obvious spike after 2000. Can we even trust the trends we observe before the year 1970 with so little content being produced? We should also check the level of user interaction with anime over time. In other words, we can count the total number of ratings on the site all animes published in a particular year and make a plot over time.
+```{r}
+query4 = "select cast(strftime('%Y',a.start_date) as int) year,sum(count) s from
+(select u.anime_id,count(u.score) count from user_records u group by u.anime_id) inner join anime_info a on anime_id = a.id
+group by cast(strftime('%Y',a.start_date) as int) having year > 0"
+yearsDF2 <- dbGetQuery(con,query4)
+p <- ggplot(data=yearsDF2,aes(x=year,y=s)) +
+  geom_bar(stat="identity") +
+  theme(axis.text.x=element_text(angle=90,hjust=1,vjust=1))+
+  xlab("Year") + ylab("Number of Ratings for Animes from each year") +
+  xlim(1960, 2025)
+
+p
+```
+As expected, the shape of the two plots are extremely similiar. It makes sense that on years where more animes are produced, more reviews are given to those animes. Some takeaways are how the COVID19 pandemic clearly decreased anime production starting from 2020. However, the decreased number of ratings for those years of anime is likely due to the fact that those shows are still relatively fresh and not all users have had an equal chance to view them as the older animes. 
+
+## Data Analysis
+### Experience and Anime Eras vs ratings
+With the exploration phase over, I have some questions I think I can answer with ANOVA and correlations. First, I believe that as a person watches more and more shows, they start to get disinterested and even run out of shows that suit their taste. **In other words, I suspect there is an inverse relationship between average anime rating and number of animes a user has watched.** Another factor I must keep in mind, however, is that people who have watched more anime are more likely to be have been watching it for longer (eg. they are likely older) and thus have been exposed to older anime. For example, one legendary user on myanimelist is named 'Archeon.' Born in 1975, he has lived twice as long as me and he claims to have completed 1338 anime (imagine almost a year's worth of nonstop watching). He is extremely active as an anime critic, and his average rating of 6.84 is significantly lower than my 7.64, though I would even call him forgiving compared to some other critics who have seen thousands of shows. Our data exploration has shown that mean anime ratings do flucuate throughout the years. so **is the "era" that a user watches anime in also a good predictor of the user's ratings?** It may even be a better predictor than anime experience. 
+
+Note: I will now refer to the average release year of  user's completed animes as the user's "era"
+We will make a linear regression model based on these two factors
+```{r}
+query5 = "select avg(u.score) av,count(u.score) c,avg(cast(strftime('%Y',a.start_date) as int)) y from user_records u  
+inner join anime_info a on a.id = u.anime_id and a.media_type='tv' and cast(strftime('%Y',a.start_date) as int) > 0 group by u.username"
+experienceDF <- dbGetQuery(con,query5)
+experienceDF$y = experienceDF$y - 2000 #setting better baseline
+dim(experienceDF)
+model = lm(av~c+y,data = experienceDF)
+```
+I would like to point out that SQL is extremly slow at "funneling" data from its output into R dataframes. I've experienced the same in python. For over 600,000 rows, the query itself takes under a second, but actually fetching the data into R takes about 10 minutes on my laptop. In the rest of this project, I will have even larger result sets and will likely implement random sampling. This will make the queries themselves much less efficient, but it will speed up fetch times.
+```{r}
+summary(model)
+```
+Judging by the R squared, this model does not explain much of the variability in the user's scores, but that's expected. I don't expect the era and experience of a user to be the largest factors in their enjoyment of anime. I just wanted to see if there were significant trends.
+```{r}
+round(coef(model),3)
+```
+So far, we know that both of the predictors havea negative slope, and the values of them suggests that for ever 333 anime a user watches, their average score is expected to go down by 1. For every 10 years a user's "era" increases, their average rating is expected to decrease by .13. Quite fascinating results!
+```{r}
+anova(model)
+```
+The F tests in anova confirm our findings are significant. This is fascinating! Let's make the model predict average scores for my data, and then for an imaginary user who has watched 1200 anime and whose "era" was around 2000. The point is that this user is more experienced and older than me.
+```{r}
+#keep in mind y is years after 2000
+predict(model,data.frame(c=88,y=20),interval = "confidence") # me
+predict(model,data.frame(c=1200,y=0),interval = "confidence") #other guy
+```
+Look at the stark difference between our predicted average scores!
+I am also curious how the line of best fit compares to the scatterplot of data. I am pretty certain the trend is not linear. It probably is a curve where slope starts negative and increases as c (number of animes watched) increases. After all, most people wouldn't watch thousands of shows if they completely despised them, right? There has to be a point of diminishing losses in enjoyment.
+```{r}
+plot(experienceDF$c,experienceDF$av,cex=.1,xlab = "number of animes watched",ylab="average user rating")
+abline(a=coef(model)[1],b=coef(model)[2],col="red")
+```
+I think the biggest takeway from this plot is the R squared value and how it is visualized. Relative to the slope, the variation around the line of best is extremely large, indicating how little about average scores the # of animes watched explains.
+```{r}
+#plot(experienceDF$y,experienceDF$av,cex=.1,xlab="Average release year of animes watched (+2000)")
+#head(experienceDF)
+back = tapply(experienceDF$av,as.integer(experienceDF$y),median)
+plot(back,type="l",xlab="Average release year of animes watched (+2000)",xaxt="n",ylab="Average user score")
+axis(1,labels=as.integer(names(back))+2000,at=1:length(back))
+abline(a=coef(model)[1],b=coef(model)[3],col="blue")
+```
+The same goes for the "era" predictor. I would not trust this model to predict someone's average rating based on soley these factors. I also need to verify which predictor is actually doing more of the explaining, so I will manually "step" for that and make a model only based on # of animes watched. 
+```{r}
+modelSmaller = lm(av~c,data = experienceDF)
+summary(modelSmaller)
+```
+Wow, the R squared value only decreased by around .03. I guess the "era" of anime a user watches barely explained their average score compared to how many animes they have watched. Another thing to point out is the residual standard error. Because all anime ratings are integers between 0 and 10, this error  of .9 is obviously high (it's almost a tenth of the entire spectrum). This further demonstrates how little this model explains on its own. I think calculating the standard deviation of all of the anime scores would be beneficial to compare residual errors against.
+
+Another interesting consideration is that a linear model may not be appropriate for the relationship between era and average score. Many agree that anime had its golden age during the 1990's, with many of the classics from tat decade still being enjoyed and given top ratings today. Thus, it is reasonable to guess that an upside-down parabola would be a better fit for predicting average scores based on anime "era." However, I do not know how to fit or interpret curved regression models. The graph below will illustrate the golden era in the 1990's. This graph also slightly contradicts the pattern in my other rating by year graph, but that graph was inconsistent for years before 1990 because very few anime existed back then that fit my criteria, which was relatively short TV shows.
+```{r}
+query6 = "Select avg(u.score) average,substr(a.start_date,1,4) dates from (
+user_records u inner join
+anime_info a on u.anime_id = a.id 
+and a.media_type='tv' and Cast (
+    JulianDay(a.end_date) - JulianDay(a.start_date)
+ As Integer) < 183) -- this means shows that only last 26 or less episodes 
+group by substr(a.start_date,1,4) --order by dates"
+goldenage = dbGetQuery(con,query6)
+goldenage$dates = as.numeric(goldenage$dates)
+p <- ggplot(data=goldenage,aes(x=dates,y=average)) +
+  geom_rect(data=NULL,aes(xmin=1990,xmax=2000,ymin=0,ymax=10),
+            alpha=0.3,fill="pink") +
+  geom_bar(stat="identity") +
+  theme(axis.text.x=element_text(angle=90,hjust=1,vjust=1))+
+  xlab("Year") + ylab("Average rating of all (short) anime produced by year") +
+  xlim(1960, 2025)
+  
+
+p
+```
+
+```{r}
+sdquery = "SELECT AVG((u.score - sub.a) * (u.score - sub.a)) as var from user_records u, (SELECT AVG(score) AS a FROM user_records) AS sub;"
+variance = dbGetQuery(con,sdquery)
+sqrt(variance[1,1])
+```
+Now we can compare Residual SE for scores to 1.68 as a general guide. The .9 Residual SE from the previous model is definitely lower, but not by enough in my opinion.
+
+###Correlations between scores of different anime
+We all know that our current preference for tv shows can be at least partly explained by our past watching decisions and reviews. That's how Netflix can boast that 80% of its watched content is based on its algorithmic recommendations. With anime, I think there are bound to be certain types of shows whose ratings are strongly correlated. From now on, I will refer to the pearson correlation between all of the scores given to two shows by all users who have watched both shows as the "correlation between animes." In other words, if anime1 and anime2 are given scores 5,7,6 and 5,8,6 respectively by the same 3 people, these animes are more strongly correlated than anime3, which was given scores 7,4,3 by the same 3 peeople. 
+
+I predict that shows that contain the same genres will have stronger correlations between their scores. 
+ 
+**I also expect to see different seasons from the same show as very strongly correlated.** This intuitively makes sense since most of the content and target audience of shows stays the same across multiple seasons. Myanimelist.com lists different seasons of a show as separate shows, so I will manually browse the data to see if correlated shows are indeed different seasons of the same show.
+
+Lastly, **I predict that shows from the same year and especially the same season of that year will be strongly correlated.** My logic behind this is that as a person's life changes, so do their preferences. However, within one year or a few months, a typical person's life does not change much, thus making their ratings for the shows during that time more similiar. Also, although this is anecdotal evidence, many myanimelist.com users do not update their ratings regularly. Instead, they log onto the site about a few times a year just to log the shows they remember watching. Therefore, these types of people are more likely to only remember shows by the approximate time they watched them and not give them distinctive ratings based on content. Some even argue that this is the correct way to use the website and that more active users are pretentious or gatekeeping, but that's a discussion for another day.
+```{r setup, include = T}
+library(reticulate)
+use_python("C:/Users/dtrag/AppData/Local/Programs/Python/Python39/python.exe",required=T)
+```
+This code connects to the SQL database in python
+```{python}
+import sqlite3
+con = sqlite3.connect("animeDB2.sqlite3")
+#con.execute("select * from anime_info where score > 9.0").fetchall()
+```
+This code defines a custom aggregation function that takes two lists and finds the correlation between them. It then registers the function to the SQLite interpreter.
+```{python}
+import numpy
+class myCorr:
+    def __init__(self):
+        self.count = 0
+        self.list1 = []
+        self.list2 = []
+    def step(self, value1,value2):
+        self.list1.append(value1)
+        self.list2.append(value2)
+    def finalize(self):
+        #print(self.list1[:10])
+        #print(self.list2[:10])
+        if len(self.list1) and len(self.list2):
+            self.correlation = numpy.corrcoef(self.list1,self.list2)[0][1]
+        else:
+            self.correlation = 0.0
+        return self.correlation
+
+con.create_aggregate("corr", 2, myCorr)
+```
+Now, this long SQL query will find every user who has watched a specific show. It will then create pairs of integers that represent the user's rating for said show (id1) , and every other show they have watched (id2). It will repeat this for every user, creating a long chain of rating pairs. It will then group those pairs by the id2 column and apply the correlation function to find the pearson correlation between the ratings for id1 and id2. Then, if we sort in descending order, we get the animes most correlated with eachother on top of the result set. One consideration is that this query takes an extremely long time for popular shows since they can have millions of rating pairs, so for shows that exceed an arbitrary threshold of ratings, I will take a random subset of ratings. I have wrapped up all of this in a python function that can takes an anime id as an input and gets the animes highest correlated to it.
+```{python}
+import pandas as pd
+from datetime import datetime
+cur = con.cursor()
+def calcCorrelations(anime_id):
+    cur.execute(f"select num_scoring_users from anime_info where id = {anime_id}")
+    occurances = cur.fetchone()[0]
+    print(f"num_scoring_users: {occurances}")
+    small = f"""select * from
+    (select corr(score1,score2) scores,anime_id from 
+    ((select anime_id as anime_id2,username as username2,score as score2  from user_records where anime_id in({anime_id})) 
+    inner join  (select anime_id,username,score as score1 from user_records)
+    on  username = username2) group by anime_id) inner join (select anime_title,id from anime_info where num_scoring_users > 4000)  on anime_id=id order by scores desc limit 1000;"""
+    large =    f"""select * from
+    (select corr(score1,score2) scores,anime_id from 
+    ((select anime_id as anime_id2,username as username2,score as score2  from user_records where anime_id in({anime_id}) order by random() limit 15000) 
+    inner join  (select anime_id,username,score as score1 from user_records)
+    on  username = username2) group by anime_id) inner join (select anime_title,id from anime_info where num_scoring_users > 10000)  on anime_id=id order by scores desc limit 1000;""" 
+    start = datetime.now()
+    if occurances > 17000:
+        print("large")
+        data = cur.execute(large).fetchall()
+    else:
+        print("small")
+        data = cur.execute(small).fetchall()
+    print("done")
+    #print(asizeof.asizeof(result))
+    print((datetime.now()-start))
+    return pd.DataFrame(data,columns=["correlation","id","title","id2"])
+corr20 = calcCorrelations(61)
+```
+The reticulate library lets us read python pandas dataframes as R dataframes
+```{r}
+head(py$corr20)
+```
+Reading the head of this dataframe gives us the correlation coefficients for the animes best correlated to the anime with id 61. After some manual review, these correlation coefficients seemed rather high, so I manually checked how many pairs of ratings they were based on. Most were only watched together with show 61 less than 1000 times in my datatset. Also, if you notice, I excluded certain animes from my results that weren't popular enough with the last inner join, but that alone doesn't make everything significant. That's because there is a good chance, out of thousands of shows, that at least a few are highly correlated with each-other by pure chance. I don't know if 1000 people is enough to make the correlation coefficient significant, so let's tackle this with R instead of python. This will be much slower due to the larger amount of data I have to fetch because RSqlite does not suppert custom aggregate functions, and because R is calculating significance for each correlation. For a reference alpha level, I will take .05 and divide by (# of valid shows) to the total combinations of 2 shows. For example, if I select only shows with at least 5000 ratings, only 4315 of such shows exist, so my alpha level would be .05/(4315) = 1.16e-5. I am not sure if this is a fair way to do this, but alpha levels are situational anyway and for this situation, this makes sense. It also is very similiar to bonferroni's correction for t tests.
+
+In this query, I will try to do the same process as before, but instead I will do the aggregation in R with R's corr.test function to get significance. Also, notice the "order by random() limit n)" that is in this query and the previous. What this does is get n random users who have watched a certain anime and get all of their other ratings. I believe this small random sample of users will be representative of over 600,000 users, and will help the query run much faster. However, one side effect of this method is that by limiting our users, we limit the range of shows we can compare, since typically fewer users will have seen fewer distinct animes collectively. Therefore, more popular shows will likely be favored in this method, but that has technically always been the case, since my data is a sample of all users on myanimelist.com.
+```{r}
+
+anime_id = 20899
+possibleusers = dbGetQuery(con,"select distinct username from user_records")
+randomUsers = sample(possibleusers$username,size=100000)
+query7 = paste("
+select u.score score1,f.score score2,f.anime_id from user_records f 
+inner join (select * from user_records where anime_id = ",anime_id," and username in(",paste(randomUsers,collapse=","),")) as u on u.username = f.username
+inner join anime_info a on a.id=f.anime_id and a.num_scoring_users > 10000",sep=" ")
+score.pairs <- dbGetQuery(con,query7)
+agg = function(x1){
+  c1 = as.numeric(sapply(strsplit(x1,";"),function(b){return(b[1])}))
+  c2 = as.numeric(sapply(strsplit(x1,";"),function(b){return(b[2])}))
+
+  if(length(na.omit(c1)) < 3){
+    return (c(0.0,1.0))
+  }
+  t = cor.test(c1,c2)
+  return (c(t$estimate["cor"],t$p.value))
+}
+```
+At this point, I arbitrarily selected a sample size and minimum popularity level that made my SQL query run fast and give some consistent results.
+```{r}
+score.pairs.agg = aggregate(paste(as.character(score1),as.character(score2), sep=";", collapse=NULL) ~ anime_id, data = score.pairs, FUN = agg,simplify = F)
+score.pairs.agg = setNames(score.pairs.agg,c("id","correlation"))
+
+#cor.test(iris$Sepal.Length,iris$Sepal.Width)$estimate["cor"]
+score.pairs.agg$p.value =sapply(score.pairs.agg$correlation,
+                                function(x) x[[2]])
+score.pairs.agg$estimate =sapply(score.pairs.agg$correlation,
+                                function(x) x[[1]])
+head(score.pairs.agg)[1,2]
+```
+
+```{r}
+pair.names <- dbGetQuery(con,"select id,anime_title from anime_info")
+score.pairs.agg2 = merge(score.pairs.agg,pair.names, by.x="id",by.y="id")
+#Using p value calculated above 1.16e-5
+score.pairs.agg.significant = subset(score.pairs.agg2,p.value<.0000116)
+score.pairs.agg.significant[order(-score.pairs.agg.significant$estimate),]
+```
+After doing all of the aggregation, reducing the data, and finding correlations and significance, we can see that for the show "JoJo no Kimyou na Bouken Part 3: Stardust Crusaders", there are 5 seasons currently released, and every single one of them show up at the top of the correlations to the part 3, with significances well below the alpha level. This shows how different seasons of the same show tend to be correlated, but I need to demonstrate it on multiple shows to prove that this test isn't a fluke. To do this, I will select an arbitrary list of  anime that have at least 3 seasons, and get the top 10 anime correlated with each. I will also choose the "baseline" anime to be the second season of each simply because it prevents wasting computational power on users who have only rated season one of a show.
+
+```{r}
+multiseason = c(33486,23281,23847,28891,11597,15451,10030,24277)
+top10s = list()
+possibleusers = dbGetQuery(con,"select distinct username from user_records")
+for (i in c(1:length(multiseason))){
+randomUsers = sample(possibleusers$username,size=110000)
+query7 = paste("
+select u.score score1,f.score score2,f.anime_id from user_records f 
+inner join (select * from user_records where anime_id = ",multiseason[i]," and username in(",paste(randomUsers,collapse=","),")) as u on u.username = f.username
+inner join anime_info a on a.id=f.anime_id and a.num_scoring_users > 10000",sep=" ")
+score.pairs <- dbGetQuery(con,query7)
+
+agg = function(x1){
+  c1 = as.numeric(sapply(strsplit(x1,";"),function(b){return(b[1])}))
+  c2 = as.numeric(sapply(strsplit(x1,";"),function(b){return(b[2])}))
+
+  if(length(na.omit(c1)) < 3){
+    return (c(0.0,1.0))
+  }
+  t = cor.test(c1,c2)
+  return (c(t$estimate["cor"],t$p.value))
+}
+score.pairs.agg = aggregate(paste(as.character(score1),as.character(score2), sep=";", collapse=NULL) ~ anime_id, data = score.pairs, FUN = agg,simplify = F)
+score.pairs.agg = setNames(score.pairs.agg,c("id","correlation"))
+
+#cor.test(iris$Sepal.Length,iris$Sepal.Width)$estimate["cor"]
+score.pairs.agg$p.value =sapply(score.pairs.agg$correlation,
+                                function(x) x[[2]])
+score.pairs.agg$estimate =sapply(score.pairs.agg$correlation,
+                                function(x) x[[1]])
+pair.names <- dbGetQuery(con,"select id,anime_title from anime_info")
+score.pairs.agg2 = merge(score.pairs.agg,pair.names, by.x="id",by.y="id")
+#Using p value calculated by .01/3354 potential comparisons
+score.pairs.agg.significant = subset(score.pairs.agg2,p.value<.01/3354)
+score.pairs.agg.significant= score.pairs.agg.significant[order(-score.pairs.agg.significant$estimate),]
+  top10s[[i]] = score.pairs.agg.significant$anime_title[1:10]
+}
+top10s
+```
+Even for those who don't watch anime, it is obvious that parts of the same series were very highly correlated together. Just look at the titles. To reiterate how these results were generated, the SQL query got every user (from a random sample) who watched a particular anime I chose and made pairs of that rating and every other rating the user had. Then, the correlation algorthm found the correlation between every pair of animes and the significance. It filtered out insignificant values and ordered the dataframe with the highest correlation coefficients on top. The 10 animes with the highest correlation coefficients to the chosen anime were added to the list. The top 1 highest correlation coefficient is always for the original anime itself, since that correlation is always 1. I could have done this for more anime, but it would take a very long time to run. Take a moment to appreciate how low the chance of these results happening at random. That should be enough. 
+
+
 ```{r}
 query1 = "select distinct(genres) g from anime_info"
 allGenres <- dbGetQuery(con,query1)
@@ -126,7 +399,3 @@ temp = apply(allGenres, MARGIN = 1, growVector)
 unique_genres <- unique(unique_genres)
 unique_genres
 ```
-```{r}
-
-```
-
